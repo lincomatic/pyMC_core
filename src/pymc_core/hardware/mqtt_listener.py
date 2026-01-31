@@ -3,6 +3,8 @@ import json
 import logging
 import time
 import configparser
+import threading
+from collections import deque
 import paho.mqtt.client as mqtt
 
 from typing import Any, Callable, Dict, Optional
@@ -14,7 +16,10 @@ logger = logging.getLogger("MQTTRadio")
 class MQTTRadio(LoRaRadio):
     def __init__(self, config_file="mqtt_config.ini"):
         self._rx_event = asyncio.Event()
-        self._event_loop = None;
+        self._event_loop = None
+        # FIFO buffer for incoming raw packets and lock for thread-safety
+        self.raw = deque()
+        self._raw_lock = threading.Lock()
         
         logger.info(f"Config file: {config_file}")
         self.config = configparser.ConfigParser()
@@ -95,11 +100,22 @@ class MQTTRadio(LoRaRadio):
         topic = msg.topic
         payload = msg.payload.decode('utf-8')
         jsondata = json.loads(payload)
-        self.raw = bytes.fromhex(jsondata.get("raw",""))
+        rawstr = jsondata.get("raw","")
+        if rawstr == "":
+            logger.info("Ignoring empty packet")
+            return
+        new_raw = bytes.fromhex(rawstr)
+
+        # Append to FIFO with thread-safety
+        try:
+            with self._raw_lock:
+                self.raw.append(new_raw)
+        except Exception as e:
+            logger.warning(f"[RX] Failed to append to FIFO: {e}")
 
         # Log to console and file
         logger.info(f"Received message from topic: {topic}")
-        logger.info(f"Packet length: {len(self.raw)} bytes")
+        logger.info(f"Packet length: {len(new_raw)} bytes; queued packets: {len(self.raw)}")
 
         # Check if RX task is dead and restart it
         if (
@@ -108,15 +124,46 @@ class MQTTRadio(LoRaRadio):
             or self._rx_task.done()
         ):
             try:
-                loop = asyncio.get_running_loop()
-                self._rx_task = loop.create_task(self._rx_background_task())
-                logger.warning("[RX] Restarted dead RX task")
-                return False  # Was dead, now restarted
+                # If we have an event loop reference, create the task there thread-safely
+                if hasattr(self, "_event_loop") and self._event_loop is not None:
+                    def _start_rx_task():
+                        try:
+                            # Only restart if still not running
+                            if (not hasattr(self, "_rx_task")
+                                or self._rx_task is None
+                                or self._rx_task.done()):
+                                self._rx_task = asyncio.create_task(self._rx_background_task())
+                                logger.warning("[RX] Restarted dead RX task")
+                        except Exception as e:
+                            logger.warning(f"[RX] Failed to start RX task inside loop: {e}")
+
+                    self._event_loop.call_soon_threadsafe(_start_rx_task)
+                    return
+                else:
+                    # Fallback: try to start from current thread (may fail)
+                    loop = asyncio.get_running_loop()
+                    self._rx_task = loop.create_task(self._rx_background_task())
+                    logger.warning("[RX] Restarted dead RX task")
+                    return
             except Exception:
                 logger.warning("[RX] Failed to restart dead RX task")
-                return False  # Failed to restart
+                return
 
-        self._rx_event.set()
+        # Wake up the asyncio reader thread-safely
+        if hasattr(self, "_event_loop") and self._event_loop is not None:
+            try:
+                self._event_loop.call_soon_threadsafe(self._rx_event.set)
+            except Exception as e:
+                logger.warning(f"[RX] Failed to signal event via loop: {e}")
+                try:
+                    self._rx_event.set()
+                except Exception as e2:
+                    logger.warning(f"[RX] Failed to set event directly: {e2}")
+        else:
+            try:
+                self._rx_event.set()
+            except Exception as e:
+                logger.warning(f"[RX] Failed to set event directly: {e}")
 
 
 
@@ -155,8 +202,17 @@ class MQTTRadio(LoRaRadio):
         while True:
             try:
                 await self._rx_event.wait()
-                logger.info(f"*****calling RX callback****")
-                self.rx_callback(self.raw)
+                logger.info("*****calling RX callback****")
+                # Drain FIFO and process each packet
+                while True:
+                    with self._raw_lock:
+                        if not self.raw:
+                            break
+                        packet = self.raw.popleft()
+                    try:
+                        self.rx_callback(packet)
+                    except Exception as e:
+                        logger.warning(f"RX callback exception {e}")
                 self._rx_event.clear()
             except Exception as e:
                 logger.warning(f"RX background task exception {e}")
@@ -174,7 +230,7 @@ class MQTTRadio(LoRaRadio):
         
         try:
             loop = asyncio.get_running_loop()
-            self._event_loop = loop;
+            self._event_loop = loop
             self._rx_task = loop.create_task(self._rx_background_task())
         except RuntimeError:
             logger.debug("No event loop available for RX task startup")

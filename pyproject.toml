@@ -60,10 +60,10 @@ docs = [
 all = ["pymc_core[hardware,websocket,dev,docs]"]
 
 [project.urls]
-Homepage = "https://github.com/rightup/pyMC_core"
+Homepage = "https://github.com/lincomatic/pyMC_core"
 Documentation = "https://rightup.github.io/rightup/pyMC_core"
-Repository = "https://github.com/rightup/pyMC_core.git"
-Issues = "https://github.com/rightup/pyMC_core/issues"
+Repository = "https://github.com/lincomatic/pyMC_core.git"
+Issues = "https://github.com/lincomatic/pyMC_core/issues"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

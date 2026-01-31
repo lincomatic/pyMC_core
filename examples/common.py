@@ -38,6 +38,14 @@ def create_radio(radio_type: str = "waveshare", serial_port: str = "/dev/ttyUSB0
     logger.info(f"Creating radio for {radio_type}...")
 
     try:
+        if radio_type == "mqtt":
+            from pymc_core.hardware.mqtt_listener import MQTTRadio
+
+            logger.debug("Using MQTTRadio")
+            mqtt_radio = MQTTRadio(config_file="c:/dev/meshcore/pymc/pyMC_core/config_mqtt.ini")
+            logger.info("Created MQTTRadio instance")
+            return mqtt_radio
+        
         # Check if this is a KISS TNC configuration
         if radio_type == "kiss-tnc":
             from pymc_core.hardware.kiss_serial_wrapper import KissSerialWrapper

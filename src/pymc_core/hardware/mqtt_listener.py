@@ -119,6 +119,40 @@ class MQTTRadio(LoRaRadio):
     def on_message(self, client, userdata, msg):
         """Callback for when a message is received"""
         topic = msg.topic
+
+        # Parse IATA and pubkey from topic of form: meshcore/<IATA>/pubkey/packets
+        iata = None
+        observer = None
+        try:
+            parts = topic.split("/")
+            if len(parts) >= 3 and parts[0] == "meshcore":
+                iata = parts[1]
+                pubkey = parts[2]
+            else:
+                # tolerant fallback: find "meshcore" and take the next segments if available
+                if "meshcore" in parts:
+                    idx = parts.index("meshcore")
+                    if idx + 1 < len(parts):
+                        iata = parts[idx + 1]
+                    if idx + 2 < len(parts):
+                        pubkey = parts[idx + 2]
+        except Exception:
+            iata = None
+            pubkey = None
+
+        if iata == None:
+            iata = "unk"
+        else:
+            iata = iata.upper()
+
+        if pubkey is None:
+            observer = "unk"
+        else:
+            observer = pubkey[:4].lower()
+
+        self.last_iata = iata
+        self.observer = observer
+        
         payload = msg.payload.decode('utf-8')
         jsondata = json.loads(payload)
         rawstr = jsondata.get("raw","")
@@ -134,8 +168,8 @@ class MQTTRadio(LoRaRadio):
         except Exception as e:
             logger.warning(f"[RX] Failed to append to FIFO: {e}")
 
-        # Log to console and file
-        logger.info(f"Received message from topic: {topic}")
+        # Log to console and file (include parsed IATA when present)
+        logger.info(f"rx from topic: {topic} (iata={iata}, (obs={observer})")
         logger.info(f"Packet length: {len(new_raw)} bytes; queued packets: {len(self.raw)}")
 
         # Check if RX task is dead and restart it

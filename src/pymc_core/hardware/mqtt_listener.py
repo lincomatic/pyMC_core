@@ -13,6 +13,13 @@ from .base import LoRaRadio
 logger = logging.getLogger("MQTTRadio")
 
 
+class PktInfo:
+    """Metadata about a received packet"""
+    def __init__(self, iata: str, observer: str):
+        self.iata = iata
+        self.observer = observer
+
+
 class MQTTRadio(LoRaRadio):
     def __init__(self, config_file="mqtt_config.ini"):
         self._rx_event = asyncio.Event()
@@ -164,7 +171,8 @@ class MQTTRadio(LoRaRadio):
         # Append to FIFO with thread-safety
         try:
             with self._raw_lock:
-                self.raw.append(new_raw)
+                pktinfo = PktInfo(iata=iata, observer=observer)
+                self.raw.append((new_raw, pktinfo))
         except Exception as e:
             logger.warning(f"[RX] Failed to append to FIFO: {e}")
 
@@ -264,9 +272,9 @@ class MQTTRadio(LoRaRadio):
                     with self._raw_lock:
                         if not self.raw:
                             break
-                        packet = self.raw.popleft()
+                        packet, pktinfo = self.raw.popleft()
                     try:
-                        self.rx_callback(packet)
+                        self.rx_callback(packet, pktinfo)
                     except Exception as e:
                         logger.warning(f"RX callback exception {e}")
                 self._rx_event.clear()
@@ -275,7 +283,7 @@ class MQTTRadio(LoRaRadio):
                 
         logger.info("EXITING RX TASK")
 
-    def set_rx_callback(self, callback: Callable[[bytes], None]):
+    def set_rx_callback(self, callback: Callable[[bytes, PktInfo], None]):
         """
         Set the RX callback function
 

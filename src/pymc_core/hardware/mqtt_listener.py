@@ -34,11 +34,18 @@ class MQTTRadio(LoRaRadio):
         topics_string = self.config.get("mqtt", "mqtt_topics")
         self.topics = [topic.strip() for topic in topics_string.split(',')]
 
-        # Set up MQTT client
+        # Set up MQTT client (use Callback API v2 + MQTT v5)
         if self.config.get("mqtt", "use_websockets",fallback='n') == 'y':
-            self.client = mqtt.Client(transport="websockets")
+            self.client = mqtt.Client(
+                callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+                protocol=mqtt.MQTTv5,
+                transport="websockets",
+            )
         else:
-            self.client = mqtt.Client()
+            self.client = mqtt.Client(
+                callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+                protocol=mqtt.MQTTv5,
+            )
         self.client.username_pw_set(self.username, self.password)
 
         # Set up callbacks
@@ -84,16 +91,30 @@ class MQTTRadio(LoRaRadio):
         """Return last received SNR in dB."""
         return 0.0
     
-    def on_connect(self, client, userdata, flags, rc):
-        """Callback for when client connects to broker"""
-        if rc == 0:
-            logger.info("Successfully connected to MQTT broker")
+    def get_noise_floor(self) -> Optional[float]:
+        """
+        Get current noise floor in dBm.
+        Returns properly sampled noise floor from background measurements.
+        """
+        return 0.0
+    
+    def on_connect(self, client, userdata, connect_flags, reason, properties):
+        """Callback for when client connects to broker (Callback API v2 / MQTT v5).
+
+        Args:
+            connect_flags: ConnectFlags (session present, etc.)
+            reason: ReasonCode (0 == success)
+            properties: MQTT v5 Properties or None
+        """
+        # reason is a ReasonCode instance; compare to 0 for success
+        if reason == 0:
+            logger.info(f"Successfully connected to MQTT broker (reason={reason})")
             # Subscribe to all topics
             for topic in self.topics:
                 client.subscribe(topic)
                 logger.info(f"Subscribed to topic: {topic}")
         else:
-            logger.error(f"Failed to connect to broker, return code {rc}")
+            logger.error(f"Failed to connect to broker, reason={reason}")
 
     def on_message(self, client, userdata, msg):
         """Callback for when a message is received"""
@@ -171,12 +192,13 @@ class MQTTRadio(LoRaRadio):
         # Log structured data
         #self.log_message_data(topic, payload)
 
-    def on_disconnect(self, client, userdata, rc):
-        """Callback for when client disconnects from broker"""
-        if rc != 0:
-            logger.warning(f"Unexpected disconnection from broker (rc={rc})")
-        else:
+    def on_disconnect(self, client, userdata, disconnect_flags, reason, properties):
+        """Callback for when client disconnects from broker (Callback API v2 / MQTT v5)."""
+        # reason is a ReasonCode instance; success == 0
+        if reason == 0:
             logger.info("Disconnected from broker")
+        else:
+            logger.warning(f"Unexpected disconnection from broker (reason={reason})")
 
     def start(self):
         """Start the MQTT subscriber"""

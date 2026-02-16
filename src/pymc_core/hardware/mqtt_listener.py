@@ -162,8 +162,8 @@ class MQTTRadio(LoRaRadio):
         
         payload = msg.payload.decode('utf-8')
         jsondata = json.loads(payload)
-        rawstr = jsondata.get("raw","")
-        if rawstr == "":
+        rawstr = jsondata.get("raw", "")
+        if not isinstance(rawstr, str) or rawstr == "":
             logger.info("Ignoring empty packet")
             return
         new_raw = bytes.fromhex(rawstr)

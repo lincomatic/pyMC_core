@@ -169,23 +169,32 @@ class MQTTRadio(LoRaRadio):
         new_raw = bytes.fromhex(rawstr)
 
         # Append to FIFO with thread-safety
+        queue_len = 0
         try:
             with self._raw_lock:
+                # Check for unbounded growth
+                if len(self.raw) > 1000:
+                    logger.warning(f"[RX] Queue overflow! {len(self.raw)} packets queued, dropping oldest")
+                    self.raw.popleft()  # Drop oldest packet
                 pktinfo = PktInfo(iata=iata, observer=observer)
                 self.raw.append((new_raw, pktinfo))
+                queue_len = len(self.raw)
         except Exception as e:
             logger.warning(f"[RX] Failed to append to FIFO: {e}")
+            return
 
         # Log to console and file (include parsed IATA when present)
-        logger.info(f"rx from topic: {topic} (iata={iata}, (obs={observer})")
-        logger.info(f"Packet length: {len(new_raw)} bytes; queued packets: {len(self.raw)}")
+        logger.info(f"rx from topic: {topic} (iata={iata}, obs={observer})")
+        logger.info(f"Packet length: {len(new_raw)} bytes; queued packets: {queue_len}")
 
         # Check if RX task is dead and restart it
+        task_was_dead = False
         if (
             not hasattr(self, "_rx_task")
             or self._rx_task is None
             or self._rx_task.done()
         ):
+            task_was_dead = True
             try:
                 # If we have an event loop reference, create the task there thread-safely
                 if hasattr(self, "_event_loop") and self._event_loop is not None:
@@ -201,32 +210,26 @@ class MQTTRadio(LoRaRadio):
                             logger.warning(f"[RX] Failed to start RX task inside loop: {e}")
 
                     self._event_loop.call_soon_threadsafe(_start_rx_task)
-                    return
                 else:
                     # Fallback: try to start from current thread (may fail)
-                    loop = asyncio.get_running_loop()
-                    self._rx_task = loop.create_task(self._rx_background_task())
-                    logger.warning("[RX] Restarted dead RX task")
-                    return
+                    try:
+                        loop = asyncio.get_running_loop()
+                        self._rx_task = loop.create_task(self._rx_background_task())
+                        logger.warning("[RX] Restarted dead RX task")
+                    except RuntimeError:
+                        logger.warning("[RX] Failed to restart task: no event loop in MQTT thread")
             except Exception:
                 logger.warning("[RX] Failed to restart dead RX task")
-                return
 
         # Wake up the asyncio reader thread-safely
+        # Note: asyncio.Event MUST be set through the event loop, not from MQTT thread
         if hasattr(self, "_event_loop") and self._event_loop is not None:
             try:
                 self._event_loop.call_soon_threadsafe(self._rx_event.set)
             except Exception as e:
-                logger.warning(f"[RX] Failed to signal event via loop: {e}")
-                try:
-                    self._rx_event.set()
-                except Exception as e2:
-                    logger.warning(f"[RX] Failed to set event directly: {e2}")
+                logger.warning(f"[RX] Failed to signal event: {e}")
         else:
-            try:
-                self._rx_event.set()
-            except Exception as e:
-                logger.warning(f"[RX] Failed to set event directly: {e}")
+            logger.warning("[RX] No event loop available to signal RX event")
 
 
 
@@ -263,24 +266,49 @@ class MQTTRadio(LoRaRadio):
             raise
 
     async def _rx_background_task(self):
+        """Background task that processes incoming packets from the FIFO queue.
+        
+        Continuously waits for the RX event and drains all queued packets,
+        restarting automatically after processing each batch.
+        """
         while True:
             try:
+                # Wait for signal that packets are available
                 await self._rx_event.wait()
+                self._rx_event.clear()
+                
                 logger.info("*****calling RX callback****")
+                
                 # Drain FIFO and process each packet
                 while True:
-                    with self._raw_lock:
-                        if not self.raw:
-                            break
-                        packet, pktinfo = self.raw.popleft()
+                    packet = None
+                    pktinfo = None
                     try:
-                        self.rx_callback(packet, pktinfo)
+                        with self._raw_lock:
+                            if not self.raw:
+                                break
+                            packet, pktinfo = self.raw.popleft()
                     except Exception as e:
-                        logger.warning(f"RX callback exception {e}")
-                self._rx_event.clear()
-            except Exception as e:
-                logger.warning(f"RX background task exception {e}")
+                        logger.warning(f"[RX] Error dequeuing packet: {e}")
+                        break
+                    
+                    if packet is not None:
+                        try:
+                            self.rx_callback(packet, pktinfo)
+                        except Exception as e:
+                            logger.warning(f"[RX] Callback exception: {e}")
+                            # Continue processing other packets
+                            continue
                 
+            except asyncio.CancelledError:
+                logger.info("RX background task cancelled")
+                break
+            except Exception as e:
+                logger.warning(f"[RX] Background task error: {e}")
+                # Brief pause before retry to avoid busy-loop on persistent errors
+                await asyncio.sleep(0.1)
+                continue
+        
         logger.info("EXITING RX TASK")
 
     def set_rx_callback(self, callback: Callable[[bytes, PktInfo], None]):

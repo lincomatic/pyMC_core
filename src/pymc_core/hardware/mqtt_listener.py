@@ -22,11 +22,11 @@ class PktInfo:
 
 class MQTTRadio(LoRaRadio):
     def __init__(self, config_file="mqtt_config.ini"):
-        self._rx_event = asyncio.Event()
+        self._rx_queue = None
         self._event_loop = None
-        # FIFO buffer for incoming raw packets and lock for thread-safety
-        self.raw = deque()
-        self._raw_lock = threading.Lock()
+        # Pending packets buffered until the asyncio loop is ready
+        self._pending_raw = deque()
+        self._pending_lock = threading.Lock()
         
         logger.info(f"Config file: {config_file}")
         self.config = configparser.ConfigParser()
@@ -168,24 +168,38 @@ class MQTTRadio(LoRaRadio):
             return
         new_raw = bytes.fromhex(rawstr)
 
-        # Append to FIFO with thread-safety
-        queue_len = 0
-        try:
-            with self._raw_lock:
-                # Check for unbounded growth
-                if len(self.raw) > 1000:
-                    logger.warning(f"[RX] Queue overflow! {len(self.raw)} packets queued, dropping oldest")
-                    self.raw.popleft()  # Drop oldest packet
-                pktinfo = PktInfo(iata=iata, observer=observer)
-                self.raw.append((new_raw, pktinfo))
-                queue_len = len(self.raw)
-        except Exception as e:
-            logger.warning(f"[RX] Failed to append to FIFO: {e}")
-            return
+        # Enqueue packet for async processing
+        pktinfo = PktInfo(iata=iata, observer=observer)
+        item = (new_raw, pktinfo)
+        queued = False
+        if self._event_loop is not None and self._rx_queue is not None:
+            try:
+                self._event_loop.call_soon_threadsafe(self._rx_queue.put_nowait, item)
+                queued = True
+            except Exception as e:
+                logger.warning(f"[RX] Failed to enqueue in async queue: {e}")
+
+        if not queued:
+            # Buffer locally until the event loop/queue is ready
+            try:
+                with self._pending_lock:
+                    self._pending_raw.append(item)
+            except Exception as e:
+                logger.warning(f"[RX] Failed to buffer pending packet: {e}")
+                return
 
         # Log to console and file (include parsed IATA when present)
-        logger.info(f"rx from topic: {topic} (iata={iata}, obs={observer})")
-        logger.info(f"Packet length: {len(new_raw)} bytes; queued packets: {queue_len}")
+        try:
+            pending_len = 0
+            with self._pending_lock:
+                pending_len = len(self._pending_raw)
+            queue_len = self._rx_queue.qsize() if self._rx_queue is not None else 0
+            logger.info(f"rx from topic: {topic} (iata={iata}, obs={observer})")
+            logger.info(
+                f"Packet length: {len(new_raw)} bytes; queued packets: {queue_len + pending_len}"
+            )
+        except Exception as e:
+            logger.warning(f"[RX] Failed to log queue size: {e}")
 
         # Check if RX task is dead and restart it
         task_was_dead = False
@@ -221,15 +235,7 @@ class MQTTRadio(LoRaRadio):
             except Exception:
                 logger.warning("[RX] Failed to restart dead RX task")
 
-        # Wake up the asyncio reader thread-safely
-        # Note: asyncio.Event MUST be set through the event loop, not from MQTT thread
-        if hasattr(self, "_event_loop") and self._event_loop is not None:
-            try:
-                self._event_loop.call_soon_threadsafe(self._rx_event.set)
-            except Exception as e:
-                logger.warning(f"[RX] Failed to signal event: {e}")
-        else:
-            logger.warning("[RX] No event loop available to signal RX event")
+        # No explicit wakeup needed; queue put schedules work in the event loop
 
 
 
@@ -268,37 +274,33 @@ class MQTTRadio(LoRaRadio):
     async def _rx_background_task(self):
         """Background task that processes incoming packets from the FIFO queue.
         
-        Continuously waits for the RX event and drains all queued packets,
-        restarting automatically after processing each batch.
+        Continuously waits for packets on the async queue and drains any backlog.
         """
         while True:
             try:
-                # Wait for signal that packets are available
-                await self._rx_event.wait()
-                self._rx_event.clear()
-                
-                logger.info("*****calling RX callback****")
-                
-                # Drain FIFO and process each packet
+                # Wait for packets on the asyncio queue
+                if self._rx_queue is None:
+                    await asyncio.sleep(0.05)
+                    continue
+                packet, pktinfo = await self._rx_queue.get()
+                try:
+                    qs = self._rx_queue.qsize()
+                    logger.info(f"*** calling RX callback {qs}***")
+                    self.rx_callback(packet, pktinfo)
+                except Exception as e:
+                    logger.warning(f"[RX] Callback exception: {e}")
+
+                # Drain backlog quickly without blocking
                 while True:
-                    packet = None
-                    pktinfo = None
                     try:
-                        with self._raw_lock:
-                            if not self.raw:
-                                break
-                            packet, pktinfo = self.raw.popleft()
-                    except Exception as e:
-                        logger.warning(f"[RX] Error dequeuing packet: {e}")
+                        packet, pktinfo = self._rx_queue.get_nowait()
+                    except asyncio.QueueEmpty:
                         break
-                    
-                    if packet is not None:
-                        try:
-                            self.rx_callback(packet, pktinfo)
-                        except Exception as e:
-                            logger.warning(f"[RX] Callback exception: {e}")
-                            # Continue processing other packets
-                            continue
+                    try:
+                        logger.info("*** calling RX callback from queue ***")
+                        self.rx_callback(packet, pktinfo)
+                    except Exception as e:
+                        logger.warning(f"[RX] Callback exception: {e}")
                 
             except asyncio.CancelledError:
                 logger.info("RX background task cancelled")
@@ -323,7 +325,19 @@ class MQTTRadio(LoRaRadio):
         try:
             loop = asyncio.get_running_loop()
             self._event_loop = loop
-            self._rx_task = loop.create_task(self._rx_background_task())
+            if self._rx_queue is None:
+                self._rx_queue = asyncio.Queue()
+
+            # Drain any packets received before the loop was ready
+            try:
+                with self._pending_lock:
+                    while self._pending_raw:
+                        self._rx_queue.put_nowait(self._pending_raw.popleft())
+            except Exception as e:
+                logger.warning(f"[RX] Failed to drain pending packets: {e}")
+
+            if not hasattr(self, "_rx_task") or self._rx_task is None or self._rx_task.done():
+                self._rx_task = loop.create_task(self._rx_background_task())
         except RuntimeError:
             logger.debug("No event loop available for RX task startup")
         except Exception as e:

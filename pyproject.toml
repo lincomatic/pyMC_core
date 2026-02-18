@@ -36,6 +36,7 @@ radio = ["pyserial>=3.5"]
 hardware = [
     "python-periphery>=2.4.1",
     "pyserial>=3.5",
+    "aiomqtt>=2.5.0",
 ]
 websocket = [
     "websockets>=11.0.0",

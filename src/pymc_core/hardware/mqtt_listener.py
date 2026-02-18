@@ -3,6 +3,7 @@ import json
 import logging
 import configparser
 import aiomqtt
+from aiomqtt import ProtocolVersion
 import ssl
 from typing import Any, Callable, Optional
 
@@ -78,7 +79,6 @@ class MQTTRadio(LoRaRadio):
                     context = ssl._create_unverified_context()
                 else:
                     context = ssl.create_default_context()
-                logger.info("*** fook")
 
                 logger.info("*** try connect to broker")
                 async with aiomqtt.Client(
@@ -86,13 +86,14 @@ class MQTTRadio(LoRaRadio):
                     port=self.broker_port,
                     username=self.username,
                     password=self.password,
+                    protocol=ProtocolVersion.V5,
                     transport="websockets" if self.use_ws else "tcp",
                     tls_context=context if not self.use_ws else None
                 ) as client:
                     logger.info(f"Connected to MQTT broker at {self.broker_url}")
                     
                     for topic in self.topics:
-                        await client.subscribe(topic)
+                        await client.subscribe(topic,qos=1)
                         logger.info(f"Subscribed to {topic}")
 
                     # Run message listener and queue processor together

@@ -24,9 +24,9 @@ class MQTTRadio(LoRaRadio):
     def __init__(self, config_file="mqtt_config.ini"):
         self._rx_queue = None
         self._event_loop = None
-        # Pending packets buffered until the asyncio loop is ready
-        self._pending_raw = deque()
-        self._pending_lock = threading.Lock()
+        # Atomic counter for accurate queue size tracking
+        self._queue_size = 0
+        self._queue_size_lock = threading.Lock()
         
         logger.info(f"Config file: {config_file}")
         self.config = configparser.ConfigParser()
@@ -171,32 +171,26 @@ class MQTTRadio(LoRaRadio):
         # Enqueue packet for async processing
         pktinfo = PktInfo(iata=iata, observer=observer)
         item = (new_raw, pktinfo)
-        queued = False
         if self._event_loop is not None and self._rx_queue is not None:
             try:
                 self._event_loop.call_soon_threadsafe(self._rx_queue.put_nowait, item)
-                queued = True
+                with self._queue_size_lock:
+                    self._queue_size += 1
             except Exception as e:
                 logger.warning(f"[RX] Failed to enqueue in async queue: {e}")
-
-        if not queued:
-            # Buffer locally until the event loop/queue is ready
-            try:
-                with self._pending_lock:
-                    self._pending_raw.append(item)
-            except Exception as e:
-                logger.warning(f"[RX] Failed to buffer pending packet: {e}")
                 return
+        else:
+            # No queue ready yet - drop the packet
+            logger.debug("[RX] Dropping packet received before set_rx_callback()")
+            return
 
         # Log to console and file (include parsed IATA when present)
         try:
-            pending_len = 0
-            with self._pending_lock:
-                pending_len = len(self._pending_raw)
-            queue_len = self._rx_queue.qsize() if self._rx_queue is not None else 0
+            with self._queue_size_lock:
+                queue_len = self._queue_size
             logger.info(f"rx from topic: {topic} (iata={iata}, obs={observer})")
             logger.info(
-                f"Packet length: {len(new_raw)} bytes; queued packets: {queue_len + pending_len}"
+                f"Packet length: {len(new_raw)} bytes; queued packets: {queue_len}"
             )
         except Exception as e:
             logger.warning(f"[RX] Failed to log queue size: {e}")
@@ -283,9 +277,11 @@ class MQTTRadio(LoRaRadio):
                     await asyncio.sleep(0.05)
                     continue
                 packet, pktinfo = await self._rx_queue.get()
+                with self._queue_size_lock:
+                    self._queue_size -= 1
+                    qs = self._queue_size
                 try:
-                    qs = self._rx_queue.qsize()
-                    logger.info(f"*** calling RX callback {qs}***")
+                    logger.info(f"*** RX callback {qs}***")
                     self.rx_callback(packet, pktinfo)
                 except Exception as e:
                     logger.warning(f"[RX] Callback exception: {e}")
@@ -296,8 +292,10 @@ class MQTTRadio(LoRaRadio):
                         packet, pktinfo = self._rx_queue.get_nowait()
                     except asyncio.QueueEmpty:
                         break
+                    with self._queue_size_lock:
+                        self._queue_size -= 1
                     try:
-                        logger.info("*** calling RX callback from queue ***")
+                        logger.info("*** RX callback drain ***")
                         self.rx_callback(packet, pktinfo)
                     except Exception as e:
                         logger.warning(f"[RX] Callback exception: {e}")
@@ -327,14 +325,6 @@ class MQTTRadio(LoRaRadio):
             self._event_loop = loop
             if self._rx_queue is None:
                 self._rx_queue = asyncio.Queue()
-
-            # Drain any packets received before the loop was ready
-            try:
-                with self._pending_lock:
-                    while self._pending_raw:
-                        self._rx_queue.put_nowait(self._pending_raw.popleft())
-            except Exception as e:
-                logger.warning(f"[RX] Failed to drain pending packets: {e}")
 
             if not hasattr(self, "_rx_task") or self._rx_task is None or self._rx_task.done():
                 self._rx_task = loop.create_task(self._rx_background_task())

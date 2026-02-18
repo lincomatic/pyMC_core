@@ -307,10 +307,25 @@ class Dispatcher:
         # Schedule the packet processing in the event loop
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(self._process_received_packet(data, pktinfo))
+            task = loop.create_task(self._process_received_packet(data, pktinfo))
+            # Add exception handler to prevent silent task failures
+            task.add_done_callback(self._task_exception_handler)
         except RuntimeError:
             # No event loop running, can't process packet
             self._log("No event loop running, cannot process received packet")
+    
+    def _task_exception_handler(self, task: asyncio.Task) -> None:
+        """Handle exceptions from packet processing tasks."""
+        try:
+            # This will re-raise any exception that occurred in the task
+            task.result()
+        except asyncio.CancelledError:
+            # Task was cancelled, this is normal
+            pass
+        except Exception as e:
+            # Log the exception so we know what's breaking
+            self._logger.error(f"Exception in packet processing task: {e}", exc_info=True)
+            self._log(f"Packet processing failed: {e}")
 
     async def _process_received_packet(self, data: bytes, pktinfo: Any = None) -> None:
         """Process a received packet from the radio callback.
@@ -319,85 +334,96 @@ class Dispatcher:
             data: Raw packet bytes
             pktinfo: Packet metadata (iata, observer) from radio
         """
-        self._log(f"[RX DEBUG] Processing packet: {len(data)} bytes, data: {data.hex()[:32]}...")
-
-        # Generate packet hash for deduplication and blacklist checking
-        packet_hash = self.packet_filter.generate_hash(data)
-
-        # Skip blacklisted packets (known malformed)
-        if self.packet_filter.is_blacklisted(packet_hash):
-            self._log("[RX DEBUG] Packet blacklisted, skipping")
-            return
-
-        # Skip duplicate packets
-        if self.packet_filter.is_duplicate(packet_hash):
-            self._log(f"Duplicate packet ignored (hash: {packet_hash})")
-            return
-
-        # Update packet hash tracking
-        self.packet_filter.track_packet(packet_hash)
-
-        pkt = Packet()
         try:
-            pkt.read_from(data)
-            self._log("[RX DEBUG] Packet parsed successfully")
-        except Exception as err:
-            self._log(f"Malformed packet: {err}")
-            # Blacklist this packet to avoid repeated parsing attempts
-            self.packet_filter.blacklist(packet_hash)
-            self._log(f"Blacklisted malformed packet (hash: {packet_hash})")
-            return
+            self._log(f"[RX DEBUG] Processing packet: {len(data)} bytes, data: {data.hex()[:32]}...")
 
-        ptype = pkt.header >> PH_TYPE_SHIFT
+            # Generate packet hash for deduplication and blacklist checking
+            packet_hash = self.packet_filter.generate_hash(data)
 
-        self._log(f"[RX DEBUG] Packet type: {ptype:02X}")
+            # Skip blacklisted packets (known malformed)
+            if self.packet_filter.is_blacklisted(packet_hash):
+                self._log("[RX DEBUG] Packet blacklisted, skipping")
+                return
 
-        # Add signal strength information to packet from radio
-        pkt._rssi = self.radio.get_last_rssi()
-        pkt._snr = self.radio.get_last_snr()
-        
-        # Attach packet metadata (iata, observer) from radio if available
-        if pktinfo is not None:
+            # Skip duplicate packets
+            if self.packet_filter.is_duplicate(packet_hash):
+                self._log(f"Duplicate packet ignored (hash: {packet_hash})")
+                return
+
+            # Update packet hash tracking
+            self.packet_filter.track_packet(packet_hash)
+
+            pkt = Packet()
             try:
-                pkt._pktinfo = pktinfo
-            except Exception:
-                # Packet may be slot-restricted in some environments; fallback to logging only
-                self._log("[RX DEBUG] Unable to attach pktinfo to Packet instance")
-            else:
-                self._log(f"[RX DEBUG] Packet metadata: iata={pktinfo.iata}, observer={pktinfo.observer}")
+                pkt.read_from(data)
+                self._log("[RX DEBUG] Packet parsed successfully")
+            except Exception as err:
+                self._log(f"Malformed packet: {err}")
+                # Blacklist this packet to avoid repeated parsing attempts
+                self.packet_filter.blacklist(packet_hash)
+                self._log(f"Blacklisted malformed packet (hash: {packet_hash})")
+                return
 
-        # Let the node know about this packet for analysis (statistics, caching, etc.)
-        if self.packet_analysis_callback:
-            try:
-                import asyncio
+            ptype = pkt.header >> PH_TYPE_SHIFT
 
-                if asyncio.iscoroutinefunction(self.packet_analysis_callback):
-                    await self.packet_analysis_callback(pkt, data)
+            self._log(f"[RX DEBUG] Packet type: {ptype:02X}")
+
+            # Add signal strength information to packet from radio
+            pkt._rssi = self.radio.get_last_rssi()
+            pkt._snr = self.radio.get_last_snr()
+            
+            # Attach packet metadata (iata, observer) from radio if available
+            if pktinfo is not None:
+                try:
+                    pkt._pktinfo = pktinfo
+                except Exception:
+                    # Packet may be slot-restricted in some environments; fallback to logging only
+                    self._log("[RX DEBUG] Unable to attach pktinfo to Packet instance")
                 else:
-                    self.packet_analysis_callback(pkt, data)
-                self._log("[RX DEBUG] Packet analysis callback completed")
-            except Exception as e:
-                self._log(f"Error in packet analysis callback: {e}")
+                    self._log(f"[RX DEBUG] Packet metadata: iata={pktinfo.iata}, observer={pktinfo.observer}")
 
-        # Always call raw packet callback first for logging (regardless of source)
-        if self.raw_packet_callback:
-            await self._invoke_enhanced_raw_callback(self.raw_packet_callback, pkt, data, {})
-            self._log("[RX DEBUG] Raw packet callback completed")
+            # Let the node know about this packet for analysis (statistics, caching, etc.)
+            if self.packet_analysis_callback:
+                try:
+                    import asyncio
 
-        # Check if this is our own packet before processing handlers
-        if self._is_own_packet(pkt):
-            packet_info = format_packet_info(pkt.header, len(pkt.payload))
+                    if asyncio.iscoroutinefunction(self.packet_analysis_callback):
+                        await self.packet_analysis_callback(pkt, data)
+                    else:
+                        self.packet_analysis_callback(pkt, data)
+                    self._log("[RX DEBUG] Packet analysis callback completed")
+                except Exception as e:
+                    self._logger.error(f"Error in packet analysis callback: {e}", exc_info=True)
+                    self._log(f"Error in packet analysis callback: {e}")
 
-            self._log(f"OWN PACKET RECEIVED! {packet_info}")
-            self._log(
-                "   This suggests your packet was repeated by another node and came back to you!"
-            )
-            self._log(f"Ignoring own packet (type={pkt.header >> 4:02X}) to prevent loops")
-            return
+            # Always call raw packet callback first for logging (regardless of source)
+            if self.raw_packet_callback:
+                try:
+                    await self._invoke_enhanced_raw_callback(self.raw_packet_callback, pkt, data, {})
+                    self._log("[RX DEBUG] Raw packet callback completed")
+                except Exception as e:
+                    self._logger.error(f"Error in raw packet callback: {e}", exc_info=True)
+                    self._log(f"Error in raw packet callback: {e}")
 
-        # Handle ACK matching for waiting senders
-        self._log("[RX DEBUG] Dispatching packet to handlers")
-        await self._dispatch(pkt)
+            # Check if this is our own packet before processing handlers
+            if self._is_own_packet(pkt):
+                packet_info = format_packet_info(pkt.header, len(pkt.payload))
+
+                self._log(f"OWN PACKET RECEIVED! {packet_info}")
+                self._log(
+                    "   This suggests your packet was repeated by another node and came back to you!"
+                )
+                self._log(f"Ignoring own packet (type={pkt.header >> 4:02X}) to prevent loops")
+                return
+
+            # Handle ACK matching for waiting senders
+            self._log("[RX DEBUG] Dispatching packet to handlers")
+            await self._dispatch(pkt)
+        
+        except Exception as e:
+            # Catch any unhandled exception to prevent task from dying
+            self._logger.error(f"Unhandled exception in _process_received_packet: {e}", exc_info=True)
+            self._log(f"Packet processing failed with unhandled exception: {e}")
 
     # ------------------------------------------------------------------
     # Public interface - sending and receiving packets

@@ -438,6 +438,8 @@ class Dispatcher:
                 else:
                     self.packet_analysis_callback(pkt, data)
                 self._log("[RX DEBUG] Packet analysis callback completed")
+            except Exception as e:
+                self._log(f"Error in packet analysis callback: {e}")
 
         # Notify raw packet subscribers (e.g. companion clients for PUSH_CODE_LOG_RX_DATA)
         analysis = {}

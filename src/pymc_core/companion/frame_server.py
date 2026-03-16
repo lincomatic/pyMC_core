@@ -166,8 +166,10 @@ class CompanionFrameServer:
 
     One client per companion at a time.  If a new connection arrives while
     one is already active, the existing connection is closed and the new
-    one is accepted (eviction). An idle read timeout (client_idle_timeout_sec)
-    frees the slot when no data is received. Persistence is handled through
+    one is accepted (eviction). An optional idle read timeout
+    (client_idle_timeout_sec) frees the slot when no data is received; pass
+    None to disable (no disconnect on idle, matching firmware behaviour).
+    Persistence is handled through
     overridable hook methods; the base class works with in-memory stores only.
     """
 
@@ -185,7 +187,7 @@ class CompanionFrameServer:
         stats_getter: Optional[Callable] = None,
         control_handler: Optional[Any] = None,
         heartbeat_interval: int = 15,
-        client_idle_timeout_sec: int = 120,
+        client_idle_timeout_sec: Optional[int] = 120,
     ):
         self.bridge = bridge
         self.companion_hash = companion_hash
@@ -657,7 +659,9 @@ class CompanionFrameServer:
     # Must exceed DEFAULT_MAX_CONTACTS (+2 for START/END) so that
     # _cmd_get_contacts can enqueue the full contact dump without drops.
     _WRITE_QUEUE_MAXSIZE = 2048
-    _DRAIN_BATCH = 10
+    # Drain after every frame so clients that count one TCP receive per response
+    # (e.g. _receive_count per data_received()) stay in sync with sends.
+    _DRAIN_BATCH = 1
 
     async def _writer_loop(self, writer: asyncio.StreamWriter) -> None:
         """Single writer task: pull frames from the queue, write to the
@@ -760,6 +764,16 @@ class CompanionFrameServer:
                 self.port,
             )
             old_writer = self._client_writer
+            # Cancel and await the old writer task so it's fully gone before we replace
+            # the queue and create a new task (avoids the new task being mistaken for
+            # a failed writer when the old task had already exited).
+            if self._writer_task is not None:
+                self._writer_task.cancel()
+                try:
+                    await self._writer_task
+                except asyncio.CancelledError:
+                    pass
+                self._writer_task = None
             try:
                 old_writer.close()
                 await old_writer.wait_closed()
@@ -798,8 +812,18 @@ class CompanionFrameServer:
                     break
                 payload = await reader.readexactly(frame_len)
                 await self._handle_cmd(payload)
-                if self._writer_task.done():
+                writer_task = self._writer_task
+                if writer_task is None or writer_task.done():
                     disconnect_reason = "writer_failed"
+                    if writer_task is not None and writer_task.done():
+                        exc = writer_task.exception()
+                        if exc is not None:
+                            logger.error(
+                                "Writer task failed (port=%s): %s",
+                                self.port,
+                                exc,
+                                exc_info=True,
+                            )
                     break
         except asyncio.IncompleteReadError:
             disconnect_reason = "incomplete_read"
@@ -838,6 +862,7 @@ class CompanionFrameServer:
     async def _handle_cmd(self, payload: bytes) -> None:
         """Dispatch command to handler."""
         if not payload:
+            self._write_err(ERR_CODE_ILLEGAL_ARG)
             return
         cmd = payload[0]
         data = payload[1:]
@@ -1039,7 +1064,8 @@ class CompanionFrameServer:
         if ok:
             self._write_ok()
         else:
-            self._write_err(ERR_CODE_BAD_STATE)
+            # Firmware uses ERR_CODE_NOT_FOUND for both bad channel and sendGroupMessage failure
+            self._write_err(ERR_CODE_NOT_FOUND)
 
     async def _cmd_send_binary_req(self, data: bytes) -> None:
         if len(data) < 33:
@@ -1566,6 +1592,9 @@ class CompanionFrameServer:
                 ch = self.bridge.get_channel(idx)
                 frame = _channel_info_frame(idx, ch)
                 self._write_frame(frame)
+            if max_channels_val == 0:
+                # Send at least one frame so client always gets a response per command
+                self._write_frame(_channel_info_frame(0, None))
             return
 
         if channel_idx < 0 or channel_idx >= max_channels_val:

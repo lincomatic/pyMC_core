@@ -116,6 +116,7 @@ class Packet:
         "_tx_metadata",
         "_path_hash_mode_applied",
         "_injected_for_tx",
+        "_pktinfo",
     )
 
     def __init__(self):
@@ -135,6 +136,8 @@ class Packet:
         self.transport_codes = [0, 0]  # Array of two 16-bit transport codes
         self._snr = 0
         self._rssi = 0
+        # Packet metadata populated by radio dispatcher (e.g. iata/observer)
+        self._pktinfo = None
         # Repeater flag to prevent retransmission and log drop reason
         self._do_not_retransmit = False
         self.drop_reason = None  # Optional: reason for dropping packet

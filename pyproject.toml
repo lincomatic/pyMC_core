@@ -29,7 +29,6 @@ keywords = ["mesh", "networking", "lora", "radio", "iot", "communication"]
 dependencies = [
     "pycryptodome>=3.23.0",
     "PyNaCl>=1.5.0",
-    "pyyaml>=6.0.0",
 ]
 
 [project.optional-dependencies]
@@ -39,6 +38,7 @@ hardware = [
     "spidev>=3.5",
     "pyserial>=3.5",
     "pyusb>=1.2.1",
+    "aiomqtt>=2.5.0",
 ]
 
 gpiod = ["gpiod>=2.4.0"]
@@ -65,10 +65,10 @@ docs = [
 all = ["pymc_core[hardware,websocket,dev,docs]"]
 
 [project.urls]
-Homepage = "https://github.com/rightup/pyMC_core"
+Homepage = "https://github.com/lincomatic/pyMC_core"
 Documentation = "https://rightup.github.io/rightup/pyMC_core"
-Repository = "https://github.com/rightup/pyMC_core.git"
-Issues = "https://github.com/rightup/pyMC_core/issues"
+Repository = "https://github.com/lincomatic/pyMC_core.git"
+Issues = "https://github.com/lincomatic/pyMC_core/issues"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

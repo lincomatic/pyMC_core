@@ -336,11 +336,16 @@ class Dispatcher:
         data: bytes,
         rssi: Optional[int] = None,
         snr: Optional[float] = None,
+        pktinfo: Optional = None,
     ) -> None:
-        """Called by the radio when a packet comes in. rssi/snr are per-packet when provided."""
+        """Called by the radio when a packet comes in. rssi/snr are per-packet when provided.
+        Args:
+            data: Raw packet bytes
+            pktinfo: Packet metadata (iata, observer, etc.) from radio
+        """
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(self._process_received_packet(data, rssi, snr))
+            loop.create_task(self._process_received_packet(data, rssi, snr, pktinfo))
         except RuntimeError:
             self._log("No event loop running, cannot process received packet")
 
@@ -349,8 +354,15 @@ class Dispatcher:
         data: bytes,
         rssi: Optional[int] = None,
         snr: Optional[float] = None,
+        pktinfo: Optional = None,
     ) -> None:
-        """Process received packet. rssi/snr are per-packet when provided."""
+        """Process a received packet from the radio callback. rssi/snr are per-packet when provided.
+        
+        Args:
+            data: Raw packet bytes
+            pktinfo: Packet metadata (iata, observer) from radio
+        """
+
         self._log(f"[RX DEBUG] Processing packet: {len(data)} bytes, data: {data.hex()[:32]}...")
 
         # Notify raw RX subscribers so clients can track repeats
@@ -413,6 +425,16 @@ class Dispatcher:
         # Use per-packet rssi/snr when provided (avoids race); else fall back to radio last values
         pkt._rssi = rssi if rssi is not None else self.radio.get_last_rssi()
         pkt._snr = snr if snr is not None else self.radio.get_last_snr()
+
+        # Attach packet metadata (iata, observer) from radio if available
+        if pktinfo is not None:
+            try:
+                pkt._pktinfo = pktinfo
+            except Exception:
+                # Packet may be slot-restricted in some environments; fallback to logging only
+                self._log("[RX DEBUG] Unable to attach pktinfo to Packet instance")
+            else:
+                self._log(f"[RX DEBUG] Packet metadata: iata={pktinfo.iata}, observer={pktinfo.observer}")
 
         # Let the node know about this packet for analysis (statistics, caching, etc.)
         if self.packet_analysis_callback:
@@ -695,7 +717,8 @@ class Dispatcher:
             return
 
         # Process the received packet using the same method as callbacks
-        await self._process_received_packet(data)
+        # (pktinfo is None for fallback method since we don't have it)
+        await self._process_received_packet(data, pktinfo=None)
 
     async def _invoke_callback(self, cb, pkt: Packet) -> None:
         if asyncio.iscoroutinefunction(cb):
